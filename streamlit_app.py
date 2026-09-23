@@ -1,6 +1,12 @@
 import os
-import requests
+import sys
+import tempfile
 import streamlit as st
+
+# Add backend directory to sys.path so services can be imported directly
+backend_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "backend"))
+if backend_path not in sys.path:
+    sys.path.insert(0, backend_path)
 
 # Configure Streamlit Page
 st.set_page_config(
@@ -9,38 +15,41 @@ st.set_page_config(
     layout="wide"
 )
 
-API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000/api/v1")
-
 # Title & Subheader
 st.title("📄 Multimodal Document Intelligence & RAG Assistant")
 st.caption("Upload PDFs, Scanned PDFs, Images, or DOCX files and ask questions with grounded citations.")
 
-# Check Backend API Health
-@st.cache_data(ttl=5)
-def check_backend_health():
-    try:
-        res = requests.get(f"{API_BASE_URL}/health", timeout=3)
-        if res.status_code == 200:
-            return res.json()
-    except Exception:
-        pass
-    return None
+# Initialize RAG Services
+@st.cache_resource
+def load_rag_services():
+    from app.services.chunking.chunker import DocumentChunker
+    from app.services.embeddings.embedding_service import EmbeddingService
+    from app.services.retrieval.vector_store import ChromaVectorStore
+    from app.services.generation.rag_generator import RAGGenerator
 
-health_status = check_backend_health()
+    chunker = DocumentChunker()
+    embedding_service = EmbeddingService()
+    vector_store = ChromaVectorStore()
+    generator = RAGGenerator()
+    return chunker, embedding_service, vector_store, generator
+
+try:
+    chunker, embedding_service, vector_store, generator = load_rag_services()
+    rag_ready = True
+except Exception as e:
+    rag_ready = False
+    st.error(f"Initialization error: {e}")
 
 # Initialize Session State
 if "messages" not in st.session_state:
     st.session_state.messages = []
-if "session_id" not in st.session_state:
-    st.session_state.session_id = None
+if "indexed_files" not in st.session_state:
+    st.session_state.indexed_files = []
 
 # Sidebar - Document Management
 with st.sidebar:
-    st.header("⚙️ System Status & Files")
-    if health_status:
-        st.success(f"Backend API: {health_status.get('status')} | DB: {health_status.get('database')}")
-    else:
-        st.warning("Connecting to Backend API on port 8000...")
+    st.header("⚙️ Document Manager")
+    st.success("RAG Engine Active (Self-Contained)")
 
     st.subheader("📤 Upload Document")
     uploaded_file = st.file_uploader(
@@ -50,38 +59,63 @@ with st.sidebar:
 
     if uploaded_file is not None:
         if st.button("Ingest Document", type="primary"):
-            with st.spinner("Parsing, Chunking & Indexing in ChromaDB..."):
+            with st.spinner(f"Parsing '{uploaded_file.name}' & Indexing in ChromaDB..."):
                 try:
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                    res = requests.post(f"{API_BASE_URL}/documents/upload", files=files)
-                    if res.status_code in [200, 201]:
-                        doc_info = res.json()
-                        st.success(f"Successfully indexed '{doc_info.get('filename')}' ({doc_info.get('total_pages')} pages)!")
-                        st.cache_data.clear()
-                    else:
-                        st.error(f"Upload failed: {res.text}")
-                except Exception as e:
-                    st.error(f"Connection error: {e}")
+                    # Save temporary file
+                    os.makedirs("./data/uploads", exist_ok=True)
+                    temp_path = os.path.join("./data/uploads", uploaded_file.name)
+                    with open(temp_path, "wb") as f:
+                        f.write(uploaded_file.getvalue())
 
-    # List Uploaded Documents
+                    file_ext = os.path.splitext(uploaded_file.name)[1].lower().lstrip(".")
+                    pages_data = []
+
+                    if file_ext == "pdf":
+                        from app.services.ingestion.pdf_parser import parse_pdf_document
+                        pages_data = parse_pdf_document(temp_path)
+                    elif file_ext == "docx":
+                        from app.services.ingestion.docx_parser import parse_docx_document
+                        pages_data = parse_docx_document(temp_path)
+                    else:
+                        from app.services.ocr.ocr_service import perform_ocr_on_image_bytes
+                        ocr_text = perform_ocr_on_image_bytes(uploaded_file.getvalue())
+                        pages_data = [{
+                            "page_number": 1,
+                            "text": ocr_text or f"Image file: {uploaded_file.name}",
+                            "has_usable_text": True,
+                            "content_type": "image",
+                            "image_count": 1,
+                            "images": []
+                        }]
+
+                    # Chunk & Embed
+                    chunks = chunker.create_chunks_from_pages(
+                        document_id=uploaded_file.name,
+                        filename=uploaded_file.name,
+                        pages_data=pages_data
+                    )
+
+                    if chunks:
+                        texts = [c["content"] for c in chunks]
+                        embeddings = embedding_service.embed_documents(texts)
+                        vector_store.add_chunks(chunks, embeddings)
+
+                        if uploaded_file.name not in st.session_state.indexed_files:
+                            st.session_state.indexed_files.append(uploaded_file.name)
+
+                        st.success(f"Indexed '{uploaded_file.name}' ({len(pages_data)} pages, {len(chunks)} chunks)!")
+                    else:
+                        st.warning("No text extracted from document.")
+                except Exception as e:
+                    st.error(f"Processing error: {e}")
+
+    # List Indexed Files
     st.subheader("📚 Indexed Documents")
-    try:
-        docs_res = requests.get(f"{API_BASE_URL}/documents", timeout=3)
-        if docs_res.status_code == 200:
-            docs_data = docs_res.json().get("documents", [])
-            if not docs_data:
-                st.info("No documents uploaded yet.")
-            for doc in docs_data:
-                col1, col2 = st.columns([4, 1])
-                with col1:
-                    st.text(f"• {doc['filename']} ({doc['status']})")
-                with col2:
-                    if st.button("🗑️", key=f"del_{doc['id']}"):
-                        requests.delete(f"{API_BASE_URL}/documents/{doc['id']}")
-                        st.cache_data.clear()
-                        st.rerun()
-    except Exception:
-        st.text("Could not load document list.")
+    if not st.session_state.indexed_files:
+        st.info("No documents uploaded yet.")
+    else:
+        for fname in st.session_state.indexed_files:
+            st.text(f"• {fname}")
 
 # Main Chat Interface
 for msg in st.session_state.messages:
@@ -95,40 +129,40 @@ for msg in st.session_state.messages:
 
 # User Question Input
 if user_question := st.chat_input("Ask a question about your uploaded documents..."):
-    # Add User Message
     st.session_state.messages.append({"sender": "user", "content": user_question})
     with st.chat_message("user"):
         st.markdown(user_question)
 
-    # Call RAG Assistant API
     with st.chat_message("assistant"):
-        with st.spinner("Retrieving relevant chunks & generating answer..."):
+        with st.spinner("Searching vector index & generating answer..."):
             try:
-                payload = {
-                    "question": user_question,
-                    "session_id": st.session_state.session_id,
-                    "top_k": 5
-                }
-                res = requests.post(f"{API_BASE_URL}/chat", json=payload)
-                if res.status_code == 200:
-                    data = res.json()
-                    answer = data.get("answer", "")
-                    citations = data.get("citations", [])
-                    st.session_state.session_id = data.get("session_id")
+                # Retrieve relevant chunks from ChromaDB
+                query_vector = embedding_service.embed_query(user_question)
+                relevant_chunks = vector_store.similarity_search(
+                    query_embedding=query_vector,
+                    top_k=5
+                )
 
-                    st.markdown(answer)
-                    if citations:
-                        st.markdown("---")
-                        st.caption("📚 **Sources & Citations:**")
-                        for cit in citations:
-                            st.info(f"📄 **{cit['document']}** — Page {cit['page']}")
+                # Generate Answer
+                result = generator.generate_answer(
+                    question=user_question,
+                    retrieved_chunks=relevant_chunks
+                )
 
-                    st.session_state.messages.append({
-                        "sender": "assistant",
-                        "content": answer,
-                        "citations": citations
-                    })
-                else:
-                    st.error("Error from RAG Assistant server.")
+                answer = result.get("answer", "")
+                citations = result.get("citations", [])
+
+                st.markdown(answer)
+                if citations:
+                    st.markdown("---")
+                    st.caption("📚 **Sources & Citations:**")
+                    for cit in citations:
+                        st.info(f"📄 **{cit['document']}** — Page {cit['page']}")
+
+                st.session_state.messages.append({
+                    "sender": "assistant",
+                    "content": answer,
+                    "citations": citations
+                })
             except Exception as e:
-                st.error(f"Failed to reach RAG Assistant: {e}")
+                st.error(f"Search error: {e}")
